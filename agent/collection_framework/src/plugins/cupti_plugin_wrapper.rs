@@ -86,6 +86,38 @@ const INJECTION_ATTEMPTS: u32 = 3;
 /// identical failures and three identical log lines.
 const INJECTION_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+/// Parse `AIPROF_CUPTI_VERBOSE`. cuprof routes every diagnostic it has,
+/// including the CUPTI result codes, through a `Logf` that returns immediately
+/// unless `CUPROF_VERBOSE` is set, so a window that comes back with an empty
+/// kernel timeline is otherwise undiagnosable from the client log.
+///
+/// Off by default because `Logf` writes to the target's stderr, which belongs
+/// to the application being profiled rather than to us. It is not a volume
+/// concern: of its five call sites, four print only on failure or on dropped
+/// records, so a healthy window emits one line.
+fn cuprof_verbose_from_env(raw: Option<&str>) -> bool {
+    let value = raw.unwrap_or("").trim();
+    if value.is_empty() {
+        return false;
+    }
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        // Warn the way an unrecognised AIPROF_CUPTI_PREFER does. A switch that
+        // silently swallows a typo is indistinguishable from one that is on.
+        // Note that cuprof's own `strtol(..) != 0` would read "2" as on; we do
+        // not pass the value through, so "2" is off and says so.
+        other => {
+            log::warn!(
+                "AIPROF_CUPTI_VERBOSE='{}' is not one of 1/true/yes/on or 0/false/no/off; \
+                leaving cuprof's diagnostics off",
+                other
+            );
+            false
+        }
+    }
+}
+
 /// Field 22 of `/proc/<pid>/stat`, the target's start time in clock ticks since
 /// boot. `comm` (field 2) is parenthesised and may itself contain spaces and
 /// parentheses, so the field count has to begin after the *last* ')'.
@@ -158,6 +190,24 @@ fn cuprof_resident(pid: i32) -> Option<String> {
     let module = format!("{}{}.so", r#const::CUPTI_DST_PATH, pid);
     let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
     maps_shows_module(&maps, &module).then_some(module)
+}
+
+/// Build the KEY=VALUE body cuprof reads (see
+/// src/plugins/cuprof/docs/embedding.md). Split out from the write so the
+/// field-selection rules are testable without going through /proc.
+fn cuprof_config_content(config: &CuprofConfig) -> String {
+    let mut content = String::new();
+    content.push_str(&format!("CUPROF_OUTPUT={}\n", config.output));
+    if config.duration_sec > 0 {
+        content.push_str(&format!("CUPROF_DURATION={}\n", config.duration_sec));
+    }
+    if config.verbose {
+        content.push_str("CUPROF_VERBOSE=1\n");
+    }
+    if !config.socket_path.is_empty() {
+        content.push_str(&format!("CUPROF_SOCKET={}\n", config.socket_path));
+    }
+    content
 }
 
 /// Rank a vendored `libcupti.so.<version>` file name: compare the dotted version
@@ -694,10 +744,17 @@ impl CUPTIPluginWrapper {
         // cuprof in const.rs.
         let cf_socket_path = format!("{}{}", r#const::CF_UNIXSOCK, pid);
 
+        let verbose = cuprof_verbose_from_env(env::var("AIPROF_CUPTI_VERBOSE").ok().as_deref());
+        if verbose {
+            log::info!(
+                "AIPROF_CUPTI_VERBOSE is set: cuprof will log its CUPTI diagnostics for PID {}",
+                pid
+            );
+        }
         let cuprof_cfg = CuprofConfig {
             output: log_file.clone(),
             duration_sec: args.duration as u32,
-            verbose: false,
+            verbose,
             socket_path: cf_socket_path,
         };
 
@@ -856,17 +913,7 @@ impl CUPTIPluginWrapper {
         fs::create_dir_all(dir_path).await?;
 
         // Build the KEY=VALUE config (see src/plugins/cuprof/docs/embedding.md).
-        let mut config_content = String::new();
-        config_content.push_str(&format!("CUPROF_OUTPUT={}\n", config.output));
-        if config.duration_sec > 0 {
-            config_content.push_str(&format!("CUPROF_DURATION={}\n", config.duration_sec));
-        }
-        if config.verbose {
-            config_content.push_str("CUPROF_VERBOSE=1\n");
-        }
-        if !config.socket_path.is_empty() {
-            config_content.push_str(&format!("CUPROF_SOCKET={}\n", config.socket_path));
-        }
+        let config_content = cuprof_config_content(config);
 
         fs::write(&config_path, config_content)
             .await
@@ -1011,9 +1058,9 @@ impl GenericPlugin for CUPTIPluginWrapper {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_pid, compare_cupti_candidates, cupti_staging_name, cupti_version_key,
-        maps_shows_module, parse_cupti_preference, parse_proc_starttime, pick_cupti_candidate,
-        CuptiPreference, PidIdentity,
+        classify_pid, compare_cupti_candidates, cuprof_config_content, cuprof_verbose_from_env,
+        cupti_staging_name, cupti_version_key, maps_shows_module, parse_cupti_preference,
+        parse_proc_starttime, pick_cupti_candidate, CuprofConfig, CuptiPreference, PidIdentity,
     };
 
     // Four of the ten vendored binaries carry SONAME `libcupti.so.12`
@@ -1232,6 +1279,33 @@ mod tests {
     }
 
     #[test]
+    fn verbose_parsing_accepts_the_usual_spellings_and_nothing_else() {
+        for on in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(
+                cuprof_verbose_from_env(Some(on)),
+                "'{}' should enable it",
+                on
+            );
+        }
+        // Unset stays off, and so does a value we do not recognise: a switch
+        // that silently accepts a typo looks exactly like one that is on.
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("2"),
+            Some("verbose"),
+        ] {
+            assert!(
+                !cuprof_verbose_from_env(off),
+                "{:?} should leave verbose off",
+                off
+            );
+        }
+    }
+
+    #[test]
     fn starttime_is_field_22_even_when_comm_contains_spaces_and_parens() {
         // `comm` is free text, so a naive whitespace split lands on the wrong
         // field for any process named e.g. `(my (weird) proc)`. The count has to
@@ -1302,5 +1376,35 @@ mod tests {
             "7f00-7f01 r-xp 00000000 08:01 1234    /tmp/cf_loader_cupti_4242.so (deleted)",
             module
         ));
+    }
+
+    #[test]
+    fn the_cuprof_config_carries_only_the_fields_it_was_given() {
+        let bare = CuprofConfig {
+            output: "/tmp/AIProf_4242_cupti.json".to_string(),
+            duration_sec: 0,
+            verbose: false,
+            socket_path: String::new(),
+        };
+        // duration 0 must stay out of the file: cuprof reads CUPROF_DURATION as
+        // "stop after N seconds", and writing 0 would not mean "no limit".
+        assert_eq!(
+            cuprof_config_content(&bare),
+            "CUPROF_OUTPUT=/tmp/AIProf_4242_cupti.json\n"
+        );
+
+        let full = CuprofConfig {
+            output: "/tmp/AIProf_4242_cupti.json".to_string(),
+            duration_sec: 30,
+            verbose: true,
+            socket_path: "/tmp/.cf_sock_4242".to_string(),
+        };
+        assert_eq!(
+            cuprof_config_content(&full),
+            "CUPROF_OUTPUT=/tmp/AIProf_4242_cupti.json\n\
+             CUPROF_DURATION=30\n\
+             CUPROF_VERBOSE=1\n\
+             CUPROF_SOCKET=/tmp/.cf_sock_4242\n"
+        );
     }
 }
