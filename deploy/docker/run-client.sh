@@ -26,6 +26,7 @@ PRIVILEGED="${PRIVILEGED:-0}"                  # 1=用 --privileged（内核<5.8
 BUILD="${BUILD:-0}"                            # 1=先 build 镜像
 TRANSPORT="${TRANSPORT:-}"                     # 控制平面传输：空=ws(默认) / poll(反代剥 Upgrade 头时用)
 CUPTI_PREFER="${CUPTI_PREFER:-}"               # 同 soname 有多个 vendored libcupti 时选哪个：空=最高版本(默认) / lowest / 具体文件名
+CUPTI_VERBOSE="${CUPTI_VERBOSE:-}"             # 让 cuprof 打印 CUPTI 诊断日志：1/true/yes/on 打开（默认关，输出进目标进程 stderr）
 
 usage() {
   cat <<EOF
@@ -39,6 +40,7 @@ usage() {
   --restart <policy>      重启策略                    (默认 $RESTART)
   --transport <ws|poll>   控制平面传输，反代剥 WS Upgrade 头时用 poll (默认 ws)
   --cupti-prefer <spec>   vendored libcupti 选择：highest(默认) / lowest / libcupti.so.<ver>
+  --cupti-verbose <spec>  打开 cuprof 的 CUPTI 诊断日志：1/true/yes/on（默认关）
   --privileged            用 --privileged（内核<5.8）
   --build                 起容器前先 build 镜像
   -h, --help              显示本帮助
@@ -57,6 +59,7 @@ while [ $# -gt 0 ]; do
     --restart)    RESTART="$2"; shift 2;;
     --transport)  TRANSPORT="$2"; shift 2;;
     --cupti-prefer) CUPTI_PREFER="$2"; shift 2;;
+    --cupti-verbose) CUPTI_VERBOSE="$2"; shift 2;;
     --privileged) PRIVILEGED=1; shift;;
     --build)      BUILD=1; shift;;
     -h|--help)    usage; exit 0;;
@@ -107,7 +110,21 @@ if [ -n "$CUPTI_PREFER" ]; then
   CUPTI_PREFER_ARG=(-e AIPROF_CUPTI_PREFER="$CUPTI_PREFER")
 fi
 
-echo "==> run $NAME  (SERVER_HOST=$SERVER_HOST  CLIENT_ID=$CLIENT_ID  gpus=$GPUS  transport=${TRANSPORT:-ws}  cupti=${CUPTI_PREFER:-highest})"
+# Same again for AIPROF_CUPTI_VERBOSE: cuprof drops every CUPTI result code on
+# the floor unless CUPROF_VERBOSE reaches it, so the switch has to survive the
+# hop into the container. It is off by default and stays off unless asked for.
+# The agent warns and treats an unrecognised value as off, so say the same here
+# instead of letting the summary line below imply the switch took effect.
+case "$(printf '%s' "$CUPTI_VERBOSE" | tr '[:upper:]' '[:lower:]')" in
+  ""|1|true|yes|on|0|false|no|off) ;;
+  *) echo "警告: CUPTI_VERBOSE='$CUPTI_VERBOSE' 不是 1/true/yes/on 或 0/false/no/off，agent 会告警并按关闭处理" >&2;;
+esac
+CUPTI_VERBOSE_ARG=()
+if [ -n "$CUPTI_VERBOSE" ]; then
+  CUPTI_VERBOSE_ARG=(-e AIPROF_CUPTI_VERBOSE="$CUPTI_VERBOSE")
+fi
+
+echo "==> run $NAME  (SERVER_HOST=$SERVER_HOST  CLIENT_ID=$CLIENT_ID  gpus=$GPUS  transport=${TRANSPORT:-ws}  cupti=${CUPTI_PREFER:-highest}  cupti-verbose=${CUPTI_VERBOSE:-0})"
 docker run -d --name "$NAME" --restart "$RESTART" \
   "${PID_ARG[@]}" --ipc host \
   --gpus "$GPUS" \
@@ -116,6 +133,7 @@ docker run -d --name "$NAME" --restart "$RESTART" \
   -e CLIENT_ID="$CLIENT_ID" \
   "${TRANSPORT_ARG[@]}" \
   "${CUPTI_PREFER_ARG[@]}" \
+  "${CUPTI_VERBOSE_ARG[@]}" \
   -e RUST_LOG="${RUST_LOG:-info}" \
   "$IMAGE"
 

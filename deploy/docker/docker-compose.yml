@@ -76,11 +76,14 @@ services:
       RUST_LOG: info
       # 同 soname 有多个 vendored libcupti 时选哪个：highest(默认) / lowest /
       # 具体文件名如 libcupti.so.2023.2.1。CUPTI 的最低驱动要求随补丁级别上升，
-      # 老驱动宿主上的症状是采集报成功、但 kernel 时间线是空的（CF 写死
-      # verbose: false，cuprof 的 Logf 没开 CUPROF_VERBOSE 就直接返回，所以
-      # CUPTI 的错误码不会打印出来）；这时改成 lowest。
+      # 老驱动宿主上的症状是采集报成功、但 kernel 时间线是空的；这时改成 lowest。
       # 详见 agent/collection_framework/src/third_party/cupti/README.md。
       # AIPROF_CUPTI_PREFER: lowest
+      # 排查上面那个症状时打开：让 cuprof 把 CUPTI 的返回码打出来（它的 Logf
+      # 没开 CUPROF_VERBOSE 就直接返回，所以默认什么都看不到）。输出进的是目标
+      # 进程的 stderr，不是 client 日志；5 处调用里有 4 处只在出错或丢 record 时
+      # 才打，正常一次采集只多一行。定位完记得关掉。
+      # AIPROF_CUPTI_VERBOSE: 1
     # ── GPU 访问 ── 需要 nvidia-container-toolkit。
     # docker compose 2.x：把下面这块打开；1.x 用户改成顶层 `runtime: nvidia`。
     deploy:
