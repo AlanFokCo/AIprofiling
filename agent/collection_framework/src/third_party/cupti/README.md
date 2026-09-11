@@ -187,11 +187,12 @@ against GPU-architecture coverage:
 
 - `highest` on a host still running a CUDA 12.1-era driver hands it
   `libcupti.so.2025.2.1` (CUPTI 2025.2.1, CUDA 12.8), which can ask for more
-  than that driver supports and yield zero kernels. Do not expect to be told
-  so: CollectionFramework builds its `CuprofConfig` with `verbose: false`, and
-  cuprof's `Logf` returns immediately unless `CUPROF_VERBOSE` is set, so no
-  CUPTI result code is ever printed. The observable symptom is a run that
-  reports success with an empty kernel timeline.
+  than that driver supports and yield zero kernels. CUPTI says so only through
+  cuprof's `Logf`, which returns immediately unless `CUPROF_VERBOSE` is set, so
+  with the default the observable symptom is a run that reports success with an
+  empty kernel timeline and nothing in the log to explain it.
+  `AIPROF_CUPTI_VERBOSE=1` on the agent turns those diagnostics on (see
+  **CUPTI diagnostics** below).
 - `lowest`, or pinning an older file by name, keeps the driver requirement
   down but risks CUPTI not recognising a GPU newer than the toolkit release
   the library came from.
@@ -214,6 +215,47 @@ would truncate that live inode and kill the target with SIGBUS on its next
 page-in. The temporary name deliberately does not start with
 `libcupti.so.`, so a leftover can never be mistaken for a staging
 candidate, and both of the staging error paths unlink it.
+
+## CUPTI diagnostics
+
+CollectionFramework writes cuprof's configuration into the target as
+`/tmp/cuprof_<pid>.cfg`. It used to hardcode `verbose: false` there, which
+made every CUPTI result code unreachable: cuprof routes all of them through
+a `Logf` that returns immediately unless `CUPROF_VERBOSE` is set. A window
+that came back with an empty kernel timeline therefore produced no clue at
+all, which is the failure mode `AIPROF_CUPTI_PREFER` above exists to
+diagnose.
+
+`AIPROF_CUPTI_VERBOSE` on the agent now decides that field. `1`, `true`,
+`yes` and `on` (any case, surrounding space ignored) write
+`CUPROF_VERBOSE=1`; `0`, `false`, `no`, `off` and unset leave it out; any
+other value warns in the client log and leaves it out, the way an
+unrecognised `AIPROF_CUPTI_PREFER` does. Both documented launchers forward
+it as they forward `AIPROF_CUPTI_PREFER`: `deploy/docker/run-client.sh` as
+`CUPTI_VERBOSE` (`--cupti-verbose`), and
+`deploy/docker/docker-compose.yml` commented out.
+
+What it produces is narrower than the name suggests. `Logf` has five call
+sites, all in `cupti_sink.cc`: the return code of
+`cuptiActivityRegisterCallbacks`, the return code of each
+`cuptiActivityEnable`, a `cuptiActivityGetNextRecord` failure, a count of
+records dropped under buffer pressure, and one `collecting -> <path>` line
+when collection starts. Four of the five print only on failure or on loss,
+so a healthy window emits one line. All of them go to the target's stderr
+rather than to the trace file or the client log, and that is why the
+default is off: the target's stderr belongs to the application being
+profiled, not to us.
+
+It answers whether CUPTI accepted this driver and this GPU, and whether
+activity records are being dropped. It does not explain a window that
+succeeds silently with zero kernels, because in that case CUPTI returned
+success to every call cuprof made and the only extra line is `collecting
+->`. For that symptom the lever is still `AIPROF_CUPTI_PREFER`.
+
+One precedence note: `LoadConfig()` in cuprof lets the environment win over
+the config file, so a target that already carries `CUPROF_VERBOSE` in its
+own environment overrides whatever this switch writes into the `.cfg`.
+
 
 ## Adding a new version
 
