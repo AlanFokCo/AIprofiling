@@ -1,0 +1,151 @@
+# CI for the CUPTI collector only: the Rust workspace under
+# agent/collection_framework/ and the vendored cuprof tree under
+# agent/collection_framework/src/plugins/cuprof/.
+#
+# Nothing here builds the UI, the Node BFF or the FastAPI services, so the
+# triggers are path-filtered: a UI-only or server-only change must not spend
+# runner minutes on jobs that cannot validate it.
+#
+# Also deliberately absent: a repo-wide `cargo fmt --check` gate. It fails on 34
+# files at the base commit, so it would make this workflow red on arrival.
+name: collector-ci
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'agent/collection_framework/**'
+      - 'test/native/**'
+      - 'test/unit/test_cupti_manifest.py'
+      - 'Makefile'
+      - '.github/workflows/collector-ci.yml'
+  pull_request:
+    # Same list as push: every path here is an input to one of the jobs below.
+    paths:
+      - 'agent/collection_framework/**'
+      - 'test/native/**'
+      - 'test/unit/test_cupti_manifest.py'
+      - 'Makefile'
+      - '.github/workflows/collector-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per ref; a newer push to the same PR/branch cancels the older run.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust collector (clippy + tests)
+    runs-on: ubuntu-24.04
+    # Cold clippy+test measured at ~60s with 4 parallel rustc jobs on a fast
+    # host (ubuntu 24.04, rustc 1.83.0). The committed
+    # agent/collection_framework/.cargo/config.toml routes crates.io through
+    # rsproxy.cn, which can be slow from GitHub-hosted runners, so 30min covers
+    # a cold cache and a slow mirror fetch.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: agent/collection_framework
+    env:
+      # build.rs skips the cuprof .so when $CUDA_HOME/extras/CUPTI/include/cupti.h
+      # is missing. Point it at a path that cannot exist so CI always exercises
+      # the CUDA-free branch rather than depending on whatever the image ships.
+      CUDA_HOME: /opt/cuda-not-present
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # build.rs shells out to make/cc for the injector and the pykiLoader,
+          # and bindgen 0.72 dlopens libclang to generate the injector bindings.
+          # No CUDA toolkit is required: libprofiler.a and libpystackcollector.a
+          # are vendored prebuilt, nvml-wrapper loads libnvidia-ml at runtime
+          # via libloading, and no binary links libcuda/libcupti/libnvidia-ml.
+          sudo apt-get install -y --no-install-recommends build-essential libclang-dev
+
+      - name: Pin Rust 1.83.0
+        # rustfmt is installed for parity with local `cargo fmt`, it is not gated.
+        run: |
+          rustup toolchain install 1.83.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.83.0
+          rustc --version
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Input paths are relative to the repo root, not to the job's
+          # working-directory default.
+          workspaces: 'agent/collection_framework -> target'
+
+      - name: Clippy
+        # Errors only, no `-D warnings`: CollectionFramework alone already emits
+        # ~300 clippy warnings on the base commit (470 warning lines across the
+        # workspace), so warnings must not fail the job.
+        # `-A clippy::unused_io_amount` is the single allowed lint: the
+        # collector's socket/pipe helpers intentionally discard the returned
+        # byte count. It does not fire on the base commit.
+        run: cargo clippy --workspace --all-targets -- -A clippy::unused_io_amount
+
+      - name: Tests
+        # --test-threads=1: the collector plugins mutate process and GPU state
+        # (signal handlers, dlopen, env vars), so parallel test binaries race.
+        # fifo is excluded: it has 3 pre-existing failures at the base commit
+        # that are unrelated to the CUPTI collector and not ours to fix here.
+        run: cargo test --workspace --exclude fifo -- --test-threads=1
+
+  native:
+    name: Vendored cuprof (make test-native)
+    runs-on: ubuntu-24.04
+    # Measured at ~1s once build-essential is present; the budget is checkout
+    # plus apt.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install a C++11 compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+
+      - name: Build and run the GPU-free cuprof regression test
+        # test/native compiles only cuprof's trace_writer.cc, which has no
+        # CUDA/CUPTI dependency. It is the sole automated coverage of the
+        # vendored cuprof patch series (see cuprof/VENDOR.md), so it runs on
+        # every collector change even though the runner has no GPU.
+        run: make test-native
+
+  python:
+    name: CUPTI manifest unit test
+    runs-on: ubuntu-24.04
+    # Measured at <1s for the test itself; the budget is checkout, the
+    # interpreter and pip.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # 3.11, not the 3.12 that ubuntu-24.04 ships: AGENTS.md documents
+          # `python3.11 -m pytest test/`, deploy/docker/Dockerfile.server runs
+          # python:3.11-slim-bookworm, and this test's own docstring names 3.11.
+          # Pinning it keeps CI on the interpreter contributors are told to use.
+          # The test is stdlib-only and was verified green on 3.11.16 and 3.12.3.
+          python-version: '3.11'
+
+      - name: Install pytest
+        # pytest is not preinstalled in the runner image (verified with 9.1.1).
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run the CUPTI manifest test
+        # Scoped to this file on purpose; the rest of test/unit/ is outside this
+        # workflow's ownership and is not runnable on a bare runner today:
+        # test_report_top_stacks.py and test_query_gpu_endpoints.py import the
+        # FastAPI services (httpx/fastapi), while test_folded_parser.py and
+        # test_gpu_collector.py load agent-py/, which does not exist in this
+        # repo. This file only reads src/third_party/cupti/ under
+        # agent/collection_framework/, which is inside the path filter above.
+        run: python -m pytest test/unit/test_cupti_manifest.py -q
