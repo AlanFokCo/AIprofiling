@@ -13,7 +13,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tracing as log;
 
@@ -26,6 +26,10 @@ pub struct CUPTIPluginWrapper {
     // trigger_start, otherwise it is a stale file from an earlier run left
     // behind by libcuprof.so's persistent (nodelete) load in the target.
     output_paths: HashMap<i32, (String, String, SystemTime)>,
+    // Field 22 of /proc/<pid>/stat for each target, captured at init. Every
+    // write this collector makes into a target is addressed by PID alone, so
+    // without this a recycled PID would point them at an unrelated process.
+    start_times: HashMap<i32, u64>,
 }
 
 // KEY=VALUE configuration fields for cuprof (see src/plugins/cuprof/docs/embedding.md).
@@ -71,6 +75,89 @@ fn parse_cupti_preference(raw: Option<&str>) -> CuptiPreference {
 
 fn cupti_preference() -> CuptiPreference {
     parse_cupti_preference(env::var("AIPROF_CUPTI_PREFER").ok().as_deref())
+}
+
+/// Injection attempts per collection window.
+const INJECTION_ATTEMPTS: u32 = 3;
+
+/// Pause between two injection attempts. The injector attaches with ptrace, and
+/// a target that is mid-syscall or already being traced fails the attach
+/// outright; three attempts back to back with no pause mostly produce three
+/// identical failures and three identical log lines.
+const INJECTION_RETRY_DELAY: Duration = Duration::from_millis(200);
+
+/// Field 22 of `/proc/<pid>/stat`, the target's start time in clock ticks since
+/// boot. `comm` (field 2) is parenthesised and may itself contain spaces and
+/// parentheses, so the field count has to begin after the *last* ')'.
+fn parse_proc_starttime(stat: &str) -> Option<u64> {
+    // The first token after ')' is field 3, which makes starttime the 20th.
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    fields.nth(19)?.parse().ok()
+}
+
+fn proc_starttime(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    parse_proc_starttime(&stat)
+}
+
+/// True when a `/proc/<pid>/maps` listing has `module` mapped in.
+///
+/// The columns are `address perms offset dev inode [pathname]`, so the pathname
+/// is the sixth token and not the last one: the kernel appends ` (deleted)`
+/// once the file behind a live mapping is unlinked, which is precisely the
+/// state a `-z nodelete` library ends up in. Comparing that token for equality
+/// rather than by suffix also keeps a same-named file in some other directory
+/// from counting as our own injection.
+fn maps_shows_module(maps: &str, module: &str) -> bool {
+    maps.lines().any(|line| {
+        let mut columns = line.split_whitespace();
+        let _ = columns.nth(4);
+        columns.next() == Some(module)
+    })
+}
+
+/// What a re-read of field 22 says about a PID this collector already
+/// initialised. Split out from the `/proc` read so every combination of
+/// baseline and re-read can be pinned down without a live process.
+#[derive(Debug, PartialEq, Eq)]
+enum PidIdentity {
+    Same,
+    /// No baseline was recorded at init, so there is nothing to compare.
+    Unknown,
+    Recycled {
+        recorded: u64,
+        now: u64,
+    },
+    Gone,
+}
+
+fn classify_pid(recorded: Option<u64>, current: Option<u64>) -> PidIdentity {
+    match (recorded, current) {
+        (None, _) => PidIdentity::Unknown,
+        (Some(_), None) => PidIdentity::Gone,
+        (Some(a), Some(b)) if a == b => PidIdentity::Same,
+        (Some(a), Some(b)) => PidIdentity::Recycled {
+            recorded: a,
+            now: b,
+        },
+    }
+}
+
+/// The injected libcuprof.so, when it is already mapped in `pid`.
+///
+/// Read out of `/proc/<pid>/maps` rather than from anything this process
+/// remembers, because the case that matters is an agent that restarted while
+/// its target kept running: the library is linked `-z nodelete`, so it outlives
+/// both the window and the agent that put it there.
+///
+/// Only the pathname column is compared, so a target whose `/tmp` is a symlink
+/// or a bind mount renders a resolved path here and the check misses. A miss
+/// costs the explanation and nothing else: the window then fails at
+/// `InitializeInjection()` the way it did before this check existed.
+fn cuprof_resident(pid: i32) -> Option<String> {
+    let module = format!("{}{}.so", r#const::CUPTI_DST_PATH, pid);
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid)).ok()?;
+    maps_shows_module(&maps, &module).then_some(module)
 }
 
 /// Rank a vendored `libcupti.so.<version>` file name: compare the dotted version
@@ -211,10 +298,29 @@ impl CUPTIPluginWrapper {
             config,
             status: HashMap::new(),
             output_paths: HashMap::new(),
+            start_times: HashMap::new(),
         })
     }
 
     async fn custom_init(&mut self, args: ProfileArgs) -> Result<()> {
+        // Refuse before writing anything into the target. The library copy below
+        // ends in `fs::copy`, which truncates its destination in place, and if
+        // this PID still has libcuprof.so mapped from an earlier agent run then
+        // that inode is live: truncating it makes the target's next page-in
+        // raise SIGBUS. `stage_cupti_runtime()` renames a fresh copy into place
+        // for exactly this reason, but the library copy has no such protection,
+        // so the check belongs here rather than at trigger time.
+        if let Some(module) = cuprof_resident(args.target_pid) {
+            return Err(ErrorCode::InjectFailed(Some(format!(
+                "PID {} already has {} mapped, so it cannot be collected from again: restart \
+                the target or collect from a fresh process. libcuprof.so is linked \
+                `-z nodelete` and cannot be unmapped, and InitializeInjection() cannot run \
+                twice in one process",
+                args.target_pid, module
+            )))
+            .into_error());
+        }
+
         // Try multiple candidate library paths (prefer the one next to the executable).
         let mut possible_paths = Vec::new();
 
@@ -257,6 +363,19 @@ impl CUPTIPluginWrapper {
             )))
             .into_error()
         })?;
+
+        // Record the target's start time before the first write into its
+        // filesystem, so that write and every later one can be checked against
+        // the process that was actually here.
+        match proc_starttime(args.target_pid) {
+            Some(starttime) => {
+                self.start_times.insert(args.target_pid, starttime);
+            }
+            None => log::warn!(
+                "Could not read the start time of PID {}; PID recycling will go undetected for it",
+                args.target_pid
+            ),
+        }
 
         // Copy the library into the target process's filesystem.
         let dst_path = format!(
@@ -447,6 +566,36 @@ impl CUPTIPluginWrapper {
         Ok(())
     }
 
+    /// Confirm `pid` still refers to the process this collector initialised.
+    ///
+    /// Everything the collector does to a target is destructive and addressed by
+    /// PID alone: it unlinks a stale trace, drops a `.cfg` next to it and copies
+    /// a library in. After a PID is recycled those writes land inside an
+    /// unrelated process, which is why the start time recorded at init is
+    /// re-read before any of them.
+    fn check_pid_identity(&self, pid: i32) -> Result<()> {
+        let recorded = self.start_times.get(&pid).copied();
+        match classify_pid(recorded, proc_starttime(pid)) {
+            PidIdentity::Same | PidIdentity::Unknown => Ok(()),
+            PidIdentity::Recycled { recorded, now } => {
+                let err_msg = format!(
+                    "PID {} is no longer the process this collector initialised: its start \
+                    time moved from {} to {}, so the PID has been recycled. Refusing to \
+                    write into the new process's filesystem",
+                    pid, recorded, now
+                );
+                Err(ErrorCode::TriggerCollectorError(Some(err_msg)).into_error())
+            }
+            PidIdentity::Gone => {
+                let err_msg = format!(
+                    "PID {} exited before its collection window started: /proc/{}/stat is gone",
+                    pid, pid
+                );
+                Err(ErrorCode::TriggerCollectorError(Some(err_msg)).into_error())
+            }
+        }
+    }
+
     async fn custom_trigger(&mut self, args: ProfileArgs) -> Result<()> {
         let pid = args.target_pid;
 
@@ -484,10 +633,43 @@ impl CUPTIPluginWrapper {
 
         let mut output = args.output.clone().unwrap_or_else(|| ".".to_string());
         let container_pid = if utils::is_process_in_container(pid) {
-            utils::convert_host_pid_to_container_pid(pid).unwrap_or(pid)
+            match utils::convert_host_pid_to_container_pid(pid) {
+                Ok(container_pid) => container_pid,
+                Err(e) => {
+                    // Falling back to the host PID here used to look harmless: the
+                    // collection still ran. It does not. cuprof resolves its config
+                    // as /tmp/cuprof_<pid>.cfg with its *own* namespace-local pid,
+                    // so a file written under the host pid is never read and cuprof
+                    // silently starts with its built-in defaults: no duration, no
+                    // lifecycle socket, and an output path of its own choosing. The
+                    // window then reports success with no trace behind it.
+                    let err_msg = format!(
+                        "PID {} runs in a container but its namespace-local PID could not be \
+                        resolved ({}); refusing to fall back to the host PID, because cuprof \
+                        inside the target would then never find /tmp/cuprof_<pid>.cfg and would \
+                        collect with its built-in defaults instead",
+                        pid, e
+                    );
+                    log::error!("{}", err_msg);
+                    let _ = EventHandler::global_sender()
+                        .send(SchedulerEvent::CollectFailed(CollectorName::CUPTI, pid));
+                    return Err(ErrorCode::TriggerCollectorError(Some(err_msg)).into_error());
+                }
+            }
         } else {
             pid
         };
+
+        // Guards the writes into /proc/<pid>/root below, which are addressed by
+        // PID alone and so cannot tell one process from another that happens to
+        // hold the same number. The already-injected case is caught earlier, in
+        // custom_init, because that is where the destructive copy lives.
+        if let Err(e) = self.check_pid_identity(pid) {
+            log::error!("{}", e);
+            let _ = EventHandler::global_sender()
+                .send(SchedulerEvent::CollectFailed(CollectorName::CUPTI, pid));
+            return Err(e);
+        }
         if output == "default" {
             output = format!("/proc/{}/root{}/", container_pid, r#const::DEFAULT_PATH,);
         }
@@ -586,9 +768,11 @@ impl CUPTIPluginWrapper {
 
             let sender = EventHandler::global_sender();
 
-            let mut retry_count = 0;
+            let mut attempt = 0;
+            let mut inject_ok = false;
 
-            while retry_count < 3 {
+            while attempt < INJECTION_ATTEMPTS {
+                attempt += 1;
                 let mut child = match injector_handle.spawn() {
                     Ok(child) => child,
                     Err(e) => {
@@ -615,30 +799,39 @@ impl CUPTIPluginWrapper {
                     }
                 };
                 if exit_status.success() {
+                    inject_ok = true;
                     log::info!("cuprof library injected successfully for PID: {}", pid);
                     break;
                 } else {
                     match exit_status.code() {
                         Some(code) => {
                             log::error!(
-                                "Injection execution failed. Exit code: {}, retry count: {}",
+                                "Injection execution failed. Exit code: {}, attempt {}/{}",
                                 code,
-                                retry_count
+                                attempt,
+                                INJECTION_ATTEMPTS
                             );
                         }
                         None => {
                             log::error!(
-                                "The command was terminated by the signal, retry count: {}",
-                                retry_count
+                                "The command was terminated by the signal, attempt {}/{}",
+                                attempt,
+                                INJECTION_ATTEMPTS
                             );
                         }
                     }
-                    retry_count += 1;
+                    if attempt < INJECTION_ATTEMPTS {
+                        std::thread::sleep(INJECTION_RETRY_DELAY);
+                    }
                 }
             }
 
-            if retry_count >= 3 {
-                log::error!("Injection failed after 3 attempts for PID: {}", pid);
+            if !inject_ok {
+                log::error!(
+                    "Injection failed after {} attempts for PID: {}; this window will produce no cuprof trace",
+                    INJECTION_ATTEMPTS,
+                    pid
+                );
                 let _ = sender.send(SchedulerEvent::CollectFailed(CollectorName::CUPTI, pid));
             }
         });
@@ -686,6 +879,12 @@ impl CUPTIPluginWrapper {
     async fn custom_shutdown(&mut self, pid: i32) {
         self.status.insert(pid, CollectorState::ShuttingDown);
 
+        // A recycled PID would have us copy an unrelated process's file out and
+        // report it as this task's trace. The mtime comparison below cannot
+        // always catch that on its own: the new process may well have written
+        // after this window started.
+        let pid_identity = classify_pid(self.start_times.get(&pid).copied(), proc_starttime(pid));
+
         // Copy the cuprof trace from the target's namespace into the container-
         // local workdir so the uploader picks it up. This runs after the
         // scheduler's StopCollector phase, before packaging.
@@ -696,39 +895,55 @@ impl CUPTIPluginWrapper {
         // wrote, mtime will be earlier than this task's trigger_start and we
         // must not report that old file as the current task's output.
         if let Some((host_path, local_path, trigger_start)) = self.output_paths.remove(&pid) {
-            let mtime = std::fs::metadata(&host_path).and_then(|m| m.modified());
-            match mtime {
-                Ok(mt) if mt >= trigger_start => match std::fs::copy(&host_path, &local_path) {
-                    Ok(bytes) => log::info!(
-                        "cuprof trace copied ({} bytes): {} -> {}",
-                        bytes,
-                        host_path,
-                        local_path
-                    ),
-                    Err(e) => log::warn!(
-                        "Failed to copy cuprof trace from {} to {}: {}",
-                        host_path,
-                        local_path,
-                        e
-                    ),
-                },
-                Ok(mt) => {
-                    let age_s = trigger_start
-                        .duration_since(mt)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    log::warn!(
-                        "Skipping stale cuprof trace {} (mtime is {}s older than trigger start; cuprof likely failed to run this task)",
-                        host_path,
-                        age_s
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "cuprof trace not present at {} (cuprof produced no output for this task): {}",
-                        host_path,
-                        e
-                    );
+            match pid_identity {
+                PidIdentity::Recycled { .. } => log::warn!(
+                    "Skipping the cuprof trace at {}: PID {} was recycled after init, so that file belongs to a different process now",
+                    host_path,
+                    pid
+                ),
+                PidIdentity::Gone => log::warn!(
+                    "Skipping the cuprof trace at {}: PID {} exited before its trace was read back",
+                    host_path,
+                    pid
+                ),
+                PidIdentity::Same | PidIdentity::Unknown => {
+                    let mtime = std::fs::metadata(&host_path).and_then(|m| m.modified());
+                    match mtime {
+                        Ok(mt) if mt >= trigger_start => {
+                            match std::fs::copy(&host_path, &local_path) {
+                                Ok(bytes) => log::info!(
+                                    "cuprof trace copied ({} bytes): {} -> {}",
+                                    bytes,
+                                    host_path,
+                                    local_path
+                                ),
+                                Err(e) => log::warn!(
+                                    "Failed to copy cuprof trace from {} to {}: {}",
+                                    host_path,
+                                    local_path,
+                                    e
+                                ),
+                            }
+                        }
+                        Ok(mt) => {
+                            let age_s = trigger_start
+                                .duration_since(mt)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            log::warn!(
+                                "Skipping stale cuprof trace {} (mtime is {}s older than trigger start; cuprof likely failed to run this task)",
+                                host_path,
+                                age_s
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "cuprof trace not present at {} (cuprof produced no output for this task): {}",
+                                host_path,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -796,8 +1011,9 @@ impl GenericPlugin for CUPTIPluginWrapper {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_cupti_candidates, cupti_staging_name, cupti_version_key, parse_cupti_preference,
-        pick_cupti_candidate, CuptiPreference,
+        classify_pid, compare_cupti_candidates, cupti_staging_name, cupti_version_key,
+        maps_shows_module, parse_cupti_preference, parse_proc_starttime, pick_cupti_candidate,
+        CuptiPreference, PidIdentity,
     };
 
     // Four of the ten vendored binaries carry SONAME `libcupti.so.12`
@@ -1013,5 +1229,78 @@ mod tests {
             readme.contains("AIProf-local modification (Apache-2.0 4(b))"),
             "vendored cuprof README lost its Apache-2.0 4(b) notice"
         );
+    }
+
+    #[test]
+    fn starttime_is_field_22_even_when_comm_contains_spaces_and_parens() {
+        // `comm` is free text, so a naive whitespace split lands on the wrong
+        // field for any process named e.g. `(my (weird) proc)`. The count has to
+        // start after the last ')'.
+        let nested = "1234 (my (weird) proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 10 20 \
+                      0 0 20 0 1 0 987654321 12345678 100 18446744073709551615";
+        assert_eq!(parse_proc_starttime(nested), Some(987654321));
+
+        let plain =
+            "4242 (python3) S 1 4242 4242 0 -1 4194304 200 0 0 0 5 6 0 0 20 0 2 0 555 0 0 0";
+        assert_eq!(parse_proc_starttime(plain), Some(555));
+
+        // Truncated, garbage and parenthesis-free input must yield None rather
+        // than a wrong number: a wrong number would look like a recycled PID.
+        assert_eq!(parse_proc_starttime("4242 (python3) S 1 4242"), None);
+        assert_eq!(parse_proc_starttime("not a stat line at all"), None);
+        assert_eq!(parse_proc_starttime(""), None);
+    }
+
+    #[test]
+    fn the_pid_identity_check_covers_every_baseline_and_reread_pair() {
+        assert_eq!(classify_pid(Some(7), Some(7)), PidIdentity::Same);
+        assert_eq!(
+            classify_pid(Some(7), Some(9)),
+            PidIdentity::Recycled {
+                recorded: 7,
+                now: 9
+            }
+        );
+        // No baseline was recorded at init, so there is nothing to compare and
+        // inventing a failure would only guess at it.
+        assert_eq!(classify_pid(None, Some(9)), PidIdentity::Unknown);
+        assert_eq!(classify_pid(None, None), PidIdentity::Unknown);
+        // Gone is not Recycled: nothing was written into a stranger's
+        // filesystem, and the trace is unreachable rather than somebody else's.
+        assert_eq!(classify_pid(Some(7), None), PidIdentity::Gone);
+    }
+
+    #[test]
+    fn the_maps_scan_only_matches_the_pathname_column() {
+        let module = "/tmp/cf_loader_cupti_4242.so";
+        let maps = "\
+7f8b2c000000-7f8b2c021000 r--p 00000000 08:01 1234    /tmp/cf_loader_cupti_4242.so
+7f8b2c021000-7f8b2c100000 r-xp 00021000 08:01 1234    /tmp/cf_loader_cupti_4242.so
+7f8b2c100000-7f8b2c200000 r--p 00000000 08:01 9999    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f8b2c300000-7f8b2c400000 r-xp 00000000 08:01 4242    /var/tmp/cf_loader_cupti_4242.so
+7ffd1c000000-7ffd1c021000 rw-p 00000000 00:00 0
+";
+        assert!(maps_shows_module(maps, module));
+        // A different PID's injected copy is not this PID's, and neither is a
+        // file of the same name in some other directory.
+        assert!(!maps_shows_module(maps, "/tmp/cf_loader_cupti_9999.so"));
+        assert!(!maps_shows_module(
+            "7f00-7f01 r-xp 00000000 08:01 7    /tmp/cf_loader_cupti_4242.so.bak",
+            module
+        ));
+        // The anonymous mapping has only five columns, so its inode must not be
+        // mistaken for a pathname.
+        assert!(!maps_shows_module(
+            "7ffd1c000000-7ffd1c021000 rw-p 00000000 00:00 4242",
+            module
+        ));
+        assert!(!maps_shows_module("", module));
+
+        // `-z nodelete` keeps the mapping alive after the file is unlinked, and
+        // the kernel then marks it. That is still our library.
+        assert!(maps_shows_module(
+            "7f00-7f01 r-xp 00000000 08:01 1234    /tmp/cf_loader_cupti_4242.so (deleted)",
+            module
+        ));
     }
 }
