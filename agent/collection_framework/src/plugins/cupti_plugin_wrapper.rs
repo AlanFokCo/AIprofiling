@@ -1003,8 +1003,18 @@ impl Drop for CUPTIPluginWrapper {
     fn drop(&mut self) {
         log::debug!("Dropping CuptiPluginWrapper, cleaning up resources...");
 
-        // Clean up socket and config files, but do NOT touch
-        // libcuprof.so / libcupti.so. libcuprof.so is linked `-z nodelete`, so
+        // Clean up the config file, but do NOT touch the lifecycle socket, and
+        // do NOT touch libcuprof.so / libcupti.so.
+        //
+        // The socket is left alone because this process cannot tell whether it
+        // still owns it. Another collector instance may have taken the path over
+        // after this one reclaimed it as stale, and unlinking it here would
+        // silently destroy that instance's listener, which is the failure
+        // `UnixSocketHandler::bind_listener_at` exists to prevent. It is also no
+        // longer needed: binding reclaims a socket it can prove is dead, so a
+        // leftover costs one unlink at the next run rather than sitting there.
+        //
+        // libcuprof.so is linked `-z nodelete`, so
         // it and the libcupti it pulled in stay mapped in the target for the
         // target's whole lifetime, and rewriting one of those files in place
         // makes the next kernel page-in raise SIGBUS and kill the customer
@@ -1015,11 +1025,6 @@ impl Drop for CUPTIPluginWrapper {
         // this cleanup used to assume. Once the target exits,
         // /proc/<pid>/root is gone and the files are reclaimed with it.
         for (pid, _) in &self.status {
-            let cf_sock_path = format!("/proc/{}/root{}{}", pid, r#const::CF_UNIXSOCK, pid);
-            if let Ok(_) = std::fs::remove_file(&cf_sock_path) {
-                log::debug!("Removed cuprof socket file: {}", cf_sock_path);
-            }
-
             let config_path = format!("/proc/{}/root/tmp/cuprof_{}.cfg", pid, pid);
             if let Ok(_) = std::fs::remove_file(&config_path) {
                 log::debug!("Removed cuprof config file: {}", config_path);
