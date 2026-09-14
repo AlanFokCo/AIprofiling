@@ -112,10 +112,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential
 
       - name: Build and run the GPU-free cuprof regression test
-        # test/native compiles only cuprof's trace_writer.cc, which has no
-        # CUDA/CUPTI dependency. It is the sole automated coverage of the
-        # vendored cuprof patch series (see cuprof/VENDOR.md), so it runs on
-        # every collector change even though the runner has no GPU.
+        # test/native compiles the three cuprof sources that have no CUDA/CUPTI
+        # dependency: trace_writer.cc, bounded_call.cc and config.cc. Two local
+        # patches touch trace_writer.cc and both are covered there: 0002 shifts
+        # each event timestamp from CUPTI's CLOCK_REALTIME epoch onto
+        # CLOCK_MONOTONIC by subtracting the offset LoadConfig() computed, and
+        # 0004 takes each event's duration from the raw, unshifted endpoint pair
+        # so an event that straddles the offset, or whose end_ns was never set,
+        # cannot underflow uint64. bounded_call.cc covers the deadline primitive
+        # that patch 0005 runs the CUPTI teardown under, and config.cc covers the
+        # teardown-timeout resolution LoadConfig() feeds that bound, also patch
+        # 0005. It builds three test binaries and always runs all three,
+        # aggregating their exit codes so that a failure in one cannot hide a
+        # failure in another. This is the sole automated coverage of the vendored
+        # cuprof patch series (see cuprof/VENDOR.md), so it runs on every
+        # collector change even though the runner has no GPU.
         run: make test-native
 
   python:

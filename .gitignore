@@ -54,8 +54,10 @@ credentials*
 *.o.tmp
 *.log
 
-# ---- Native (GPU-free) test binary ----
+# ---- Native (GPU-free) test binaries ----
 test/native/test_cuprof_trace_writer
+test/native/test_cuprof_bounded_call
+test/native/test_cuprof_config
 test/native/*.dSYM/
 
 # ---- Reproducer build output ----

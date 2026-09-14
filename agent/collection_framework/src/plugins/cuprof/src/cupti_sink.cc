@@ -1,7 +1,9 @@
 // AIProf-local modification (Apache-2.0 4(b)): this file differs from
-// upstream cuprof. See VENDOR.md and patches/0002-align-cupti-epoch-to-clock-monotonic.patch.
+// upstream cuprof. See VENDOR.md, patches/0002-align-cupti-epoch-to-clock-monotonic.patch
+// and patches/0005-bound-the-cupti-teardown-in-stop.patch.
 #include "cupti_sink.h"
 
+#include "bounded_call.h"
 #include "notify.h"
 
 #include <cupti.h>
@@ -176,11 +178,19 @@ void CUPTIAPI OnBufferFilled(CUcontext ctx, uint32_t streamId, uint8_t* buffer, 
 }  // namespace
 
 CuptiSink& CuptiSink::Instance() {
-    static CuptiSink instance;
-    return instance;
+    // Deliberately leaked. CUPTI delivers activity buffers on its own threads
+    // for as long as the process lives, and Append() takes mu_ and pushes into
+    // events_, so destroying the sink during exit would pull both out from under
+    // a callback that is still running. A wedged teardown makes that concrete:
+    // its worker thread is still inside cuptiActivityFlushAll and can deliver
+    // buffers long after exit() began. The library is linked -z nodelete and is
+    // process-lifetime anyway, so ~CuptiSink() never runs.
+    static CuptiSink* instance = new CuptiSink();
+    return *instance;
 }
 
-CuptiSink::CuptiSink() : running_(false), stopped_(false) {
+CuptiSink::CuptiSink()
+    : running_(false), stopped_(false), wedged_(false), teardown_in_flight_(false) {
     pthread_mutex_init(&mu_, NULL);
 }
 
@@ -194,12 +204,52 @@ void CuptiSink::Append(const Event& e) {
 
 bool CuptiSink::Start(const Config& cfg) {
     pthread_mutex_lock(&mu_);
+    if (wedged_) {
+        pthread_mutex_unlock(&mu_);
+        // An earlier window's teardown timed out, so a thread is still inside
+        // the driver holding locks this class cannot see and CUPTI's activity
+        // state is unknown: the abandoned teardown can still disable a kind
+        // this window has just enabled. Collecting anyway yields a window that
+        // is silently empty, or that wedges here in turn. Nothing upstream
+        // would report either case, because InitializeInjection()'s return
+        // value is discarded by the CUDA driver and by CollectionFramework's
+        // injector, so say it here and fail.
+        fprintf(stderr,
+                "[cuprof] refusing to start a window: an earlier CUPTI teardown did "
+                "not finish, so this process can no longer be profiled\n");
+        Notify(cfg.socket_path, "CUPTIProfilingFailed");
+        return false;
+    }
+    if (teardown_in_flight_) {
+        pthread_mutex_unlock(&mu_);
+        // The previous window is still inside its CUPTI teardown, which can run
+        // for up to Config::teardown_timeout_ms with mu_ released. Overlapping a
+        // start with it would interleave two windows in one sink: the stop in
+        // flight swaps events_ out and writes it under an output path this call
+        // has just replaced, and the teardown it abandons can still disable an
+        // activity kind this window has enabled. Refuse instead. Nothing is
+        // notified here, because the stop in flight still sends the terminal
+        // message for the window that was running, and a 0 from cuprof_start() is
+        // the documented signal that this one did not start.
+        fprintf(stderr,
+                "[cuprof] refusing to start a window while the previous one is still "
+                "stopping\n");
+        return false;
+    }
     if (running_) {
         pthread_mutex_unlock(&mu_);
         return true;
     }
     cfg_ = cfg;
     stopped_ = false;
+    // Defensive. A window only starts after a stop that has already swapped
+    // events_ empty, and a stop whose teardown timed out retires the instance
+    // rather than allowing a next window, so nothing reachable should leave
+    // records here. Clearing anyway keeps "one trace holds one window" an
+    // invariant of this class instead of a consequence of that ordering, which
+    // is what a late buffer delivery from an abandoned teardown would otherwise
+    // quietly break.
+    events_.clear();
 
     // CUPTI holds these buffer-callback pointers for the life of the process
     // (there is no per-callback unregister API), and they never change
@@ -251,17 +301,43 @@ void CuptiSink::Stop() {
     }
     stopped_ = true;
     running_ = false;
+    // Held until every exit path below, so that a Start() arriving during the
+    // bounded teardown is refused rather than interleaved with it.
+    teardown_in_flight_ = true;
     pthread_mutex_unlock(&mu_);
 
-    cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
-    cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMCPY);
-    cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMSET);
-    // Forced flush: without this, records still sitting in CUPTI's internal
-    // buffers never reach OnBufferFilled. The flush may include records for
-    // still-running work; IngestRecord drops those.
-    cuptiActivityFlushAll(1);
+    // Bounded, because this teardown can wedge inside the driver and take the
+    // whole window down with it. cuptiActivityDisable takes a libcuda write
+    // lock that a target thread inside cuLaunchKernel may never release, while
+    // CUPTI's own worker threads park on semaphores; gdb on a wedged target
+    // shows exactly that, on a 4x A10 host with driver 580.126.09, where about a
+    // third of windows hung here. Nothing in this file can unwedge the driver,
+    // so the call is bounded and a timeout degrades to "report the window as
+    // failed, keeping whatever CUPTI already delivered" instead of producing no
+    // file, no message, and an orchestrator that exits successfully on an empty
+    // report. The bound covers these CUPTI calls only: WriteChromeTrace below
+    // is not bounded, and its cost grows with the record count.
+    const unsigned teardown_timeout_ms = cfg_.teardown_timeout_ms;
+    const bool torn_down = RunBounded(
+        [] {
+            cuptiActivityDisable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+            cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMCPY);
+            cuptiActivityDisable(CUPTI_ACTIVITY_KIND_MEMSET);
+            // Forced flush: without this, records still sitting in CUPTI's
+            // internal buffers never reach OnBufferFilled. The flush may
+            // include records for still-running work; IngestRecord drops those.
+            cuptiActivityFlushAll(1);
+        },
+        teardown_timeout_ms);
 
-    Notify(cfg_.socket_path, "CUPTIProfilingStop");
+    if (torn_down) {
+        Notify(cfg_.socket_path, "CUPTIProfilingStop");
+    } else {
+        // Retire the instance: see Start().
+        pthread_mutex_lock(&mu_);
+        wedged_ = true;
+        pthread_mutex_unlock(&mu_);
+    }
 
     pthread_mutex_lock(&mu_);
     std::vector<Event> snapshot;
@@ -273,12 +349,31 @@ void CuptiSink::Stop() {
         // Without this, an orchestrator waiting for WriterOver would block
         // forever; Failed is the only terminal message that can replace it.
         Notify(cfg_.socket_path, "CUPTIProfilingFailed");
-        return;
+    } else if (!torn_down) {
+        // The file holds only what CUPTI delivered before it wedged, so it is
+        // not a complete window and must not be presented as one. Failed is the
+        // terminal message that replaces WriterOver; keeping the partial file is
+        // still worth it, because an orchestrator that copies it out gets the
+        // records that did arrive rather than nothing at all. In the observed
+        // wedge the hang is at the first cuptiActivityDisable, before any buffer
+        // was flushed, so the file is usually an empty trace.
+        fprintf(stderr,
+                "[cuprof] CUPTI teardown did not finish within %u ms; wrote the %zu "
+                "events collected before it wedged to %s and reporting failure\n",
+                teardown_timeout_ms, snapshot.size(), cfg_.output.c_str());
+        Notify(cfg_.socket_path, "CUPTIProfilingFailed");
+    } else {
+        // "WriterOver" is the consumable-file signal; anything watching the
+        // socket must key off this, not off Stop.
+        Notify(cfg_.socket_path, "CUPTIProfilingWriterOver");
+        fprintf(stderr, "[cuprof] wrote %zu events to %s\n", snapshot.size(), cfg_.output.c_str());
     }
-    // "WriterOver" is the consumable-file signal; anything watching the
-    // socket must key off this, not off Stop.
-    Notify(cfg_.socket_path, "CUPTIProfilingWriterOver");
-    fprintf(stderr, "[cuprof] wrote %zu events to %s\n", snapshot.size(), cfg_.output.c_str());
+
+    // Cleared last: WriteChromeTrace above reads cfg_, which a Start() racing in
+    // here would overwrite.
+    pthread_mutex_lock(&mu_);
+    teardown_in_flight_ = false;
+    pthread_mutex_unlock(&mu_);
 }
 
 }  // namespace cuprof

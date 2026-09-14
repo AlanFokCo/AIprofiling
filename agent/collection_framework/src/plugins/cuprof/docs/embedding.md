@@ -1,3 +1,6 @@
+<!-- AIProf-local modification (Apache-2.0 4(b)): this file differs from
+     upstream cuprof. See VENDOR.md and
+     patches/0005-bound-the-cupti-teardown-in-stop.patch. -->
 # Embedding cuprof in an external orchestrator
 
 Besides `cuprof run`, the injected library supports being loaded into an
@@ -27,9 +30,19 @@ defines the contract such a tool must follow.
    CUPROF_DURATION=30
    CUPROF_SOCKET=/tmp/.orchestrator.sock
    CUPROF_VERBOSE=1
+   CUPROF_TEARDOWN_TIMEOUT_MS=60000
    ```
 
    Paths are interpreted inside the target's mount namespace.
+
+   `CUPROF_TEARDOWN_TIMEOUT_MS` caps how long the library waits for CUPTI to
+   disable and flush its activity kinds when a window ends, in milliseconds, and
+   defaults to 30000. Read that default as a wedge detector rather than as an
+   allowance: the heaviest teardown measured, a 20s window that collected 4.5M
+   events into a 1.24 GB trace, took 82 ms. Raise it if your host is slower, and
+   raise your own idle budget for a window at the same time. It does not cover
+   the trace write that follows, which is the part that grows with the length of
+   the window.
 
 3. **Call** `cuprof_start()`. It returns 1 on success, 0 on failure.
    Collection starts immediately; there is no warmup phase.
@@ -39,8 +52,11 @@ defines the contract such a tool must follow.
    for `CUDA_INJECTION64_PATH`; prefer `cuprof_start()` in your own code.
 4. **Wait** for completion. Set `CUPROF_DURATION` so the library stops and
    writes the file on its own; with duration 0 it only flushes at process
-   exit. To collect another window from the same process, write a fresh
-   config (new `CUPROF_OUTPUT`) and call `cuprof_start()` again — the same
+   exit. Wait for that window's terminal message before starting the next one:
+   `cuprof_start()` is refused while a stop is still in flight, and refused
+   permanently once a teardown has timed out (see below). To collect another
+   window from the same process, write a fresh config (new `CUPROF_OUTPUT`) and
+   call `cuprof_start()` again — the same
    loaded instance starts the next window.
 
 5. **Never unload the library.** Do not `dlclose` `libcuprof.so`, and do not
@@ -71,13 +87,15 @@ sends one message per connection (plain text, no framing, no reply expected):
 | `CUPTIProfilingStart` | collection is active |
 | `CUPTIProfilingStop` | collection stopped, records flushed from CUPTI |
 | `CUPTIProfilingWriterOver` | the output file is complete and consumable |
-| `CUPTIProfilingFailed` | the output file could not be written; this window produces no file |
+| `CUPTIProfilingFailed` | the window did not complete: the trace file could not be written, or the CUPTI teardown timed out and the file holds only what CUPTI delivered before it wedged, or the instance was retired by an earlier timeout and never collected |
 
 Consumers must key off `CUPTIProfilingWriterOver` — after `Stop` the file may
 not exist yet. `CUPTIProfilingFailed` is the terminal failure signal for a
-window: treat it like `WriterOver` for unblocking, and do not wait for a
-file. Notifications are best-effort: a missing or dead socket never affects
-collection.
+window: treat it like `WriterOver` for unblocking, and do not assume anything
+about the file. One may be absent, and one may exist holding a partial window,
+which is worth copying out for diagnosis but must never be presented as a
+complete collection. Notifications are best-effort: a missing or dead socket
+never affects collection.
 
 ## What cuprof does not do in embedded mode
 
@@ -87,6 +105,13 @@ collection.
   library into the same process is unsupported: buffer delivery would depend
   on version-specific CUPTI re-registration behavior, and every copy leaks
   permanently (the library is `-z nodelete`).
+- No recovery from a wedged teardown. If the CUPTI teardown times out, a thread
+  is still inside the driver and CUPTI's activity state is unknown, so the
+  loaded instance is retired: later `cuprof_start()` calls return 0 and send
+  `CUPTIProfilingFailed` immediately rather than collect a window that would be
+  silently empty, or that would wedge in turn. The return value alone is not
+  enough to learn this, because `InitializeInjection()`'s caller discards it.
+  Restart the target process to profile it again. A start refused because the previous window's stop is still in flight sends nothing on the socket: that stop still owes a terminal message for the window that was running, so this refusal is reported through the return value alone. It is not the only silent failure, since a start that cannot register CUPTI's buffer callbacks, or that cannot enable a single activity kind, also returns 0 without notifying.
 - No reconfiguration of a *running* window; the config is re-read by each
   `cuprof_start()`.
 - No coexistence handling: if the target already uses CUPTI (for example a

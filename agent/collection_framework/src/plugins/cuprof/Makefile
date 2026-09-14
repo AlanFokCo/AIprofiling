@@ -1,5 +1,6 @@
 # AIProf-local modification (Apache-2.0 4(b)): this file differs from
-# upstream cuprof. See VENDOR.md and patches/0001-rpath-origin-for-ptrace-injection.patch.
+# upstream cuprof. See VENDOR.md, patches/0001-rpath-origin-for-ptrace-injection.patch
+# and patches/0005-bound-the-cupti-teardown-in-stop.patch.
 # cuprof - minimal CUPTI kernel timeline profiler
 #
 # Build artifacts:
@@ -18,7 +19,8 @@ BUILD := build
 LIB := $(BUILD)/libcuprof.so
 CLI := $(BUILD)/cuprof
 
-LIB_SRCS := src/injection.cc src/cupti_sink.cc src/trace_writer.cc src/config.cc src/notify.cc
+LIB_SRCS := src/injection.cc src/cupti_sink.cc src/trace_writer.cc src/config.cc src/notify.cc \
+            src/bounded_call.cc
 LIB_OBJS := $(LIB_SRCS:src/%.cc=$(BUILD)/%.o)
 
 # Only InitializeInjection is exported; everything else stays local so we can

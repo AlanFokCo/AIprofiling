@@ -284,9 +284,16 @@ impl UnixSocketHandler {
                                                                 // Dispatch the matching event based on the received message
                                                                 if received == r#const::FAILED_CUPTI_COLLECTOR {
                                                                     // Raw messages are only logged at debug, so surface
-                                                                    // the one that means this window produced no data.
+                                                                    // the one that means this window did not complete.
+                                                                    // cuprof sends it when it could not write the trace,
+                                                                    // when its CUPTI teardown timed out, and when it
+                                                                    // refuses to start a window in a process that an
+                                                                    // earlier timeout already retired (patches/0005). In
+                                                                    // the second case a truncated trace does exist and is
+                                                                    // still worth copying out, so do not claim there is
+                                                                    // no output.
                                                                     log::warn!(
-                                                                        "cuprof could not write its trace for pid {}; this collection window produced no output",
+                                                                        "cuprof reported pid {}'s collection window as failed; any trace it did write is incomplete",
                                                                         pid
                                                                     );
                                                                 }
