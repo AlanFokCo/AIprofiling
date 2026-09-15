@@ -1,7 +1,7 @@
 From ac1297087f9faf02548c476de97592409d23f367 Mon Sep 17 00:00:00 2001
 From: AlanFokCo <alanfok2868@gmail.com>
 Date: Thu, 10 Sep 2026 14:50:00 +0800
-Subject: [PATCH 4/4] aiprof: take the kernel duration from the raw CUPTI
+Subject: [PATCH 4/5] aiprof: take the kernel duration from the raw CUPTI
  endpoint pair
 
 Patch 0002 shifts each event endpoint from CLOCK_REALTIME to

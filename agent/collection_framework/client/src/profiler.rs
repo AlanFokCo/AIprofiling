@@ -27,9 +27,35 @@ pub fn build_command(cf_binary: &str, workdir: &Path, cfg: &ProfilingConfig) -> 
         .arg(workdir);
 
     if let Some(timeout_ms) = cfg.timeout.filter(|&t| t > 0) {
-        let secs = timeout_ms / 1000;
-        cmd.arg("--duration").arg(secs.to_string());
+        // Round up, not down: --duration is whole seconds and CF rejects a
+        // zero-second window outright, so a sub-second request has to become
+        // one second rather than truncate into a task that cannot start.
+        // --duration is also a u8, so a timeout above 255s cannot be expressed
+        // at all. Clamp and say so, rather than rounding 255.9s up to 256 and
+        // handing clap a value it rejects with a message that never mentions
+        // the timeout.
+        let secs = timeout_ms.div_ceil(1000);
+        if secs > u8::MAX as u64 {
+            log::warn!(
+                "profiling timeout {}ms exceeds the collector's {}s maximum; collecting for {}s",
+                timeout_ms,
+                u8::MAX,
+                u8::MAX
+            );
+        }
+        cmd.arg("--duration")
+            .arg(secs.min(u8::MAX as u64).to_string());
     } else if let Some((start, end)) = cfg.iteration_range() {
+        if end <= start {
+            // saturating_sub would hand CF --num-steps 0, which it rejects.
+            // Say so here, where the range is still visible, instead of
+            // spawning a subprocess to discover it.
+            log::warn!(
+                "iteration range {}..{} is empty; CollectionFramework rejects --num-steps 0",
+                start,
+                end
+            );
+        }
         cmd.arg("--iteration")
             .arg("--num-steps")
             .arg(end.saturating_sub(start).to_string())
@@ -92,7 +118,7 @@ const RUN_GRACE_SECS: u64 = 120;
 /// to a generous hard cap that still guarantees the client self-heals.
 fn run_budget(cfg: &ProfilingConfig) -> std::time::Duration {
     match cfg.timeout.filter(|&t| t > 0) {
-        Some(ms) => std::time::Duration::from_secs(ms / 1000 + RUN_GRACE_SECS),
+        Some(ms) => std::time::Duration::from_secs(ms.div_ceil(1000) + RUN_GRACE_SECS),
         None => std::time::Duration::from_secs(900),
     }
 }
@@ -170,6 +196,35 @@ mod tests {
         assert!(args.contains(&"--pids".to_string()));
         assert!(args.contains(&"1234".to_string()));
         assert!(!args.contains(&"--iteration".to_string()));
+    }
+
+    #[test]
+    fn a_sub_second_timeout_rounds_up_to_one_second() {
+        let cfg = ProfilingConfig {
+            timeout: Some(500),
+            ..Default::default()
+        };
+        let args = args_of(&build_command("./CF", &PathBuf::from("/tmp/w"), &cfg));
+        assert!(args.windows(2).any(|w| w[0] == "--duration" && w[1] == "1"));
+        assert_eq!(
+            run_budget(&cfg),
+            std::time::Duration::from_secs(1 + RUN_GRACE_SECS)
+        );
+    }
+
+    #[test]
+    fn a_timeout_above_the_u8_ceiling_is_clamped_not_rejected() {
+        // --duration is a u8. Rounding 255.999s up must not produce 256, which
+        // clap refuses with "256 is not in 0..=255" and the operator reads as a
+        // broken client rather than an over-long request.
+        let cfg = ProfilingConfig {
+            timeout: Some(255_999),
+            ..Default::default()
+        };
+        let args = args_of(&build_command("./CF", &PathBuf::from("/tmp/w"), &cfg));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--duration" && w[1] == "255"));
     }
 
     #[test]

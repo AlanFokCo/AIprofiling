@@ -1,11 +1,14 @@
 // AIProf-local modification (Apache-2.0 4(b)): this file differs from
-// upstream cuprof. See VENDOR.md and patches/0002-align-cupti-epoch-to-clock-monotonic.patch.
+// upstream cuprof. See VENDOR.md, patches/0002-align-cupti-epoch-to-clock-monotonic.patch
+// and patches/0005-bound-the-cupti-teardown-in-stop.patch.
 #include "config.h"
 
 #include <time.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -53,6 +56,30 @@ std::map<std::string, std::string> LoadCfgFile() {
     return kv;
 }
 
+// Default and clamps for the bound on the CUPTI teardown in CuptiSink::Stop().
+//
+// The default is a wedge detector, not an allowance for slow teardowns. The
+// heaviest one measured on a 4x A10 host with driver 580.126.09 - a 20s window
+// that collected 4475153 events into a 1.24 GB trace - took 82 ms of
+// cuptiActivityDisable plus cuptiActivityFlushAll, so 30s is about 370x the
+// worst healthy case observed. It is flat rather than derived from
+// CUPROF_DURATION because the teardown drains whatever CUPTI is still holding at
+// Stop(), and buffers are delivered continuously while the window runs, so that
+// residual does not grow with the window length.
+//
+// What does grow with the window is the WriteChromeTrace that follows, which took
+// 7.8s for that same trace and is not covered by this bound.
+//
+// The clamps reject nonsense rather than encode anybody's budget. Zero would
+// disable the bound, and the ceiling keeps an absurd magnitude from wrapping.
+// Nothing here can know what an orchestrator will wait for - CollectionFramework
+// gives up on a window duration + 60s after it started - so raising this key past
+// that budget is the embedder's call, and doing it turns a reportable failure
+// back into a watchdog kill.
+const unsigned kTeardownDefaultMs = 30000;
+const unsigned kTeardownMinMs = 1000;
+const unsigned kTeardownMaxMs = 600000;
+
 }  // namespace
 
 Config LoadConfig() {
@@ -60,8 +87,9 @@ Config LoadConfig() {
 
     // Environment wins over the file; the file covers processes whose
     // environment the launcher could not touch.
-    const char* keys[] = {"CUPROF_OUTPUT", "CUPROF_DURATION", "CUPROF_VERBOSE",
-                          "CUPROF_SOCKET"};
+    const char* keys[] = {"CUPROF_OUTPUT",      "CUPROF_DURATION",
+                          "CUPROF_VERBOSE",     "CUPROF_SOCKET",
+                          "CUPROF_TEARDOWN_TIMEOUT_MS"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
         const char* v = getenv(keys[i]);
         if (v && *v) kv[keys[i]] = v;
@@ -72,6 +100,32 @@ Config LoadConfig() {
     c.duration_sec = kv.count("CUPROF_DURATION")
                          ? static_cast<unsigned>(strtoul(kv["CUPROF_DURATION"].c_str(), NULL, 10))
                          : 0;
+    c.teardown_timeout_ms = kTeardownDefaultMs;
+    if (kv.count("CUPROF_TEARDOWN_TIMEOUT_MS")) {
+        // Anything that does not parse cleanly to at least kTeardownMinMs keeps
+        // the default above.
+        const char* text = kv["CUPROF_TEARDOWN_TIMEOUT_MS"].c_str();
+        // strtoull skips leading whitespace on its own, newlines included, and
+        // then accepts a '-' by wrapping it into a huge unsigned value that the
+        // clamp below would turn into the longest bound allowed. A negative
+        // timeout is a typo rather than a request for that, so it is rejected
+        // before parsing rather than left to the clamp.
+        const char* first = text + strspn(text, " \t\n\v\f\r");
+        if (*first != '-') {
+            char* end = NULL;
+            errno = 0;
+            const unsigned long long v = strtoull(first, &end, 10);
+            // The whole value has to have been consumed, so "5000abc" is a typo
+            // rather than 5000. A value too large to parse at all falls back to
+            // the default instead of arriving at the ceiling by saturation; one
+            // that parses and merely exceeds the ceiling is clamped to it.
+            const bool consumed = end != first && strspn(end, " \t\n\v\f\r") == strlen(end);
+            if (consumed && errno != ERANGE && v >= kTeardownMinMs) {
+                c.teardown_timeout_ms =
+                    v > kTeardownMaxMs ? kTeardownMaxMs : static_cast<unsigned>(v);
+            }
+        }
+    }
     c.verbose = kv.count("CUPROF_VERBOSE") && strtol(kv["CUPROF_VERBOSE"].c_str(), NULL, 10) != 0;
     c.socket_path = kv.count("CUPROF_SOCKET") ? kv["CUPROF_SOCKET"] : "";
 

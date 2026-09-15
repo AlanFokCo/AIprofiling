@@ -1,6 +1,7 @@
 <!-- AIProf-local modification (Apache-2.0 4(b)): this file differs from
-     upstream cuprof. See VENDOR.md and
-     patches/0003-readme-aiprof-cupti-alignment-note.patch. -->
+     upstream cuprof. See VENDOR.md,
+     patches/0003-readme-aiprof-cupti-alignment-note.patch and
+     patches/0005-bound-the-cupti-teardown-in-stop.patch. -->
 # cuprof
 
 A minimal CUDA kernel timeline profiler built on
@@ -119,6 +120,12 @@ keys go into the config file. The environment takes precedence over the file.
 | — | `CUPROF_SOCKET` | unset (no lifecycle notifications) |
 | — | `CUPROF_CONFIG` | `/tmp/cuprof_<pid>.cfg`, then `/tmp/cuprof.cfg` |
 | — | `CUPROF_LIB` | auto-detected next to the CLI |
+| — | `CUPROF_TEARDOWN_TIMEOUT_MS` | `30000` |
+
+`CUPROF_TEARDOWN_TIMEOUT_MS` has no flag because it is not a collection
+setting: it is the millisecond ceiling on how long the injected library waits
+for CUPTI to disable and flush when a window ends, before it gives up on that
+window and reports it failed. See `docs/embedding.md`.
 
 ## Layout
 

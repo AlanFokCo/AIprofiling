@@ -71,7 +71,7 @@ client 镜像里 `/opt/aiprof/` 下平铺了一堆预编译 `.so`：
 
 **Host libcuda 覆盖**：nvidia-container-toolkit 会把宿主 `/usr/lib/x86_64-linux-gnu/libcuda.so.*` 挂进容器 `/usr/lib64`，`LD_LIBRARY_PATH` 里那个路径优先级高于镜像自带的 `libcuda.so.535.161.07`，跨驱动版本的兼容性由宿主保证，容器不用管。
 
-**挑哪个 `libcupti`**：`cupti/` 里有 4 个文件的 soname 都是 `libcupti.so.12`（CUPTI 2023.2.1 / 2024.1.1 / 2024.3.2 / 2025.2.1），注入时按版本排序后取最高的一个。CUPTI 的最低驱动要求随补丁级别上升，而它认识的 GPU 架构也随补丁级别增加，两头不可兼得。老驱动宿主上的症状是「采集报成功、但 kernel 时间线是空的」——CF 构造 `CuprofConfig` 时写死 `verbose: false`，而 cuprof 的 `Logf` 在没开 `CUPROF_VERBOSE` 时直接返回，所以 CUPTI 的错误码根本不会打印出来。这时用 `AIPROF_CUPTI_PREFER` 改选：
+**挑哪个 `libcupti`**：`cupti/` 里有 4 个文件的 soname 都是 `libcupti.so.12`（CUPTI 2023.2.1 / 2024.1.1 / 2024.3.2 / 2025.2.1），注入时按版本排序后取最高的一个。CUPTI 的最低驱动要求随补丁级别上升，而它认识的 GPU 架构也随补丁级别增加，两头不可兼得。老驱动宿主上的症状是「采集报成功、但 kernel 时间线是空的」。CUPTI 的返回码只会经 cuprof 的 `Logf` 打出来，而 `Logf` 在没开 `CUPROF_VERBOSE` 时直接返回，所以默认什么线索都没有；先用 `AIPROF_CUPTI_VERBOSE=1` 把日志打开确认是 CUPTI 拒绝了这个驱动，再用 `AIPROF_CUPTI_PREFER` 改选：
 
 ```bash
 CUPTI_PREFER=lowest bash run-client.sh --server <host:port>       # 或 --cupti-prefer lowest
@@ -79,6 +79,8 @@ CUPTI_PREFER=libcupti.so.2024.1.1 bash run-client.sh --server <host:port>
 ```
 
 取值 `highest`（默认）/ `lowest` / 具体文件名；无法识别的值或文件不存在时告警并退回 `highest`，不会让注入失败。compose 部署改成取消 `aiprof-client.environment` 里那行注释。选中的文件、生效的偏好和全部候选都会打进 client 日志。详见 `agent/collection_framework/src/third_party/cupti/README.md`。
+
+**打开 CUPTI 诊断日志**：`CUPTI_VERBOSE=1 bash run-client.sh --server <host:port>`（或 `--cupti-verbose 1`）会把 `CUPROF_VERBOSE=1` 写进注入配置。cuprof 的 `Logf` 一共只有 5 处调用，打的是 `cuptiActivityRegisterCallbacks` 和每个 `cuptiActivityEnable` 的返回码、`cuptiActivityGetNextRecord` 失败、buffer 压力下丢弃的 record 数，以及开始采集时的一行 `collecting -> <path>`；其中 4 处只在出错或丢数据时才打，所以正常一次采集只多一行。输出进的是目标进程的 stderr，不是 trace 文件也不是 client 日志，那是被采集应用自己的日志，所以默认关闭。取值 `1`/`true`/`yes`/`on` 打开，`0`/`false`/`no`/`off` 和留空关闭，其它值会在 client 日志里告警并按关闭处理。它能回答的是「CUPTI 是否接受了这个驱动和这块卡、有没有丢 record」；采集报成功但 kernel 为 0 时它给不出更多信息，那还是要靠 `AIPROF_CUPTI_PREFER`。
 
 ## 常见问题
 

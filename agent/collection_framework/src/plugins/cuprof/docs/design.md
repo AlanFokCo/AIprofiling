@@ -1,3 +1,6 @@
+<!-- AIProf-local modification (Apache-2.0 4(b)): this file differs from
+     upstream cuprof. See VENDOR.md and
+     patches/0005-bound-the-cupti-teardown-in-stop.patch. -->
 # Design notes
 
 ## Goal
@@ -103,7 +106,11 @@ wants to join against other data.
   the sink, Stop() swaps the event buffer out and clears it, so windows do
   not accumulate into each other. Start()/Stop() state transitions are
   mutex-guarded; `atexit` and the duration timer may still race for Stop(),
-  but only the first one performs the stop sequence.
+  but only the first one performs the stop sequence. Stop()'s CUPTI teardown
+  is bounded, and a window whose teardown times out retires the instance, so
+  "serves consecutive windows" holds only for windows that ended cleanly; a
+  Start() that arrives while a stop is still in flight is refused for the same
+  reason. See `../VENDOR.md` and `patches/0005-bound-the-cupti-teardown-in-stop.patch`.
 - The forced flush can deliver records for still-running work (no end
   timestamp); IngestRecord drops them rather than emitting a wrapped
   duration into the trace.

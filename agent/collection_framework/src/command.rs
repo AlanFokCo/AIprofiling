@@ -74,7 +74,11 @@ pub struct ProfileArgs {
     #[arg(long, value_name = "Pid", required = false, num_args = 1..)]
     pub pids: Vec<i32>,
 
-    /// Collection duration, in seconds
+    /// Collection duration, in seconds; at least 1 unless --iteration is used
+    // `required_unless_present` does fire even with the default present, so a
+    // missing --duration is already rejected at parse time. What clap cannot
+    // express is that zero is not a usable window, and zero is reachable: the
+    // client derives --duration from a timeout in milliseconds. See validate().
     #[arg(
         long,
         value_name = "Duration",
@@ -289,6 +293,33 @@ impl ProfileArgs {
         let exe_path =
             env::current_exe().map_err(|e| ErrorCode::ParamsError(Some(e.to_string())))?;
 
+        // clap refuses a missing window but not a zero one, and zero is
+        // reachable: --duration 0 parses, and the client produces exactly that
+        // for any timeout below one second. A zero-second window is not a
+        // shorter window, it is a broken one, and nothing downstream objects to
+        // it. CUPTI's scheduling policy is Immediate, so the scheduler arms no
+        // auto-stop timer for it and leaves ending the collection to cuprof,
+        // while a zero duration leaves CUPROF_DURATION out of cuprof's config
+        // entirely, so cuprof never creates its StopAfterDuration thread
+        // either. Neither side stops: the run sits out the scheduler's idle
+        // budget and then exits 0 with an empty report. pyki rejects the same
+        // combination ("duration and num_steps can not be both 0"), but only
+        // from inside the target, after injection. Reject it here, before any
+        // collector is armed.
+        if self.duration == 0 && !self.iteration {
+            return Err(ErrorCode::ParamsError(Some(
+                "--duration must be at least 1 second; for a step-bounded window use \
+                --iteration together with --num-steps"
+                    .to_string(),
+            )));
+        }
+        if self.iteration && self.num_steps == 0 {
+            return Err(ErrorCode::ParamsError(Some(
+                "--iteration needs --num-steps of at least 1 to bound the collection window"
+                    .to_string(),
+            )));
+        }
+
         // When adapt is true, enable the default indicators: pystack, torch, gpu
         if let Some(true) = self.adapt {
             self.pystack = Some(true);
@@ -419,5 +450,82 @@ impl ProfileArgs {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Parse through the real CLI surface rather than `ProfileArgs::parse_from`,
+    /// which does not know the `profile` subcommand name and so would not catch
+    /// a change to how the subcommand is declared.
+    fn parse_profile(argv: &[&str]) -> ProfileArgs {
+        let mut full = vec!["CF", "profile"];
+        full.extend_from_slice(argv);
+        match Args::try_parse_from(full) {
+            Ok(Args {
+                command: Commands::Profile(args),
+                ..
+            }) => args,
+            Ok(other) => panic!("expected the profile subcommand, got {:?}", other.command),
+            Err(e) => panic!("test arguments did not parse: {}", e),
+        }
+    }
+
+    // Both rejections fire before validate() reaches the GPU detectors or the
+    // empty-pids check, so these need no GPU and no target process.
+
+    #[test]
+    fn a_zero_duration_is_rejected_before_any_collector_is_armed() {
+        let mut args = parse_profile(&["--duration", "0", "--pids", "1"]);
+        match args.validate() {
+            Err(ErrorCode::ParamsError(Some(msg))) => {
+                assert!(
+                    msg.contains("--duration"),
+                    "does not name the flag: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("--iteration"),
+                    "offers no way to bound the window by steps instead: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ParamsError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn iteration_mode_still_needs_a_non_zero_step_count() {
+        let mut args = parse_profile(&[
+            "--iteration",
+            "--num-steps",
+            "0",
+            "--num-skip-steps",
+            "0",
+            "--pids",
+            "1",
+        ]);
+        match args.validate() {
+            Err(ErrorCode::ParamsError(Some(msg))) => {
+                assert!(
+                    msg.contains("--num-steps"),
+                    "does not name the flag: {}",
+                    msg
+                );
+            }
+            other => panic!("expected ParamsError naming --num-steps, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_missing_duration_is_still_rejected_at_parse_time() {
+        // The default_value does not satisfy required_unless_present, so the
+        // parse-time guard is real: validate() is not the only thing standing
+        // between a caller and a zero-second window. Pinning it here is what
+        // stops somebody "cleaning up" the attribute later.
+        assert!(Args::try_parse_from(["CF", "profile", "--pids", "1"]).is_err());
     }
 }

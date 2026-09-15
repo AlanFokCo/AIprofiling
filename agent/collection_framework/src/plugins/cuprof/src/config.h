@@ -1,5 +1,6 @@
 // AIProf-local modification (Apache-2.0 4(b)): this file differs from
-// upstream cuprof. See VENDOR.md and patches/0002-align-cupti-epoch-to-clock-monotonic.patch.
+// upstream cuprof. See VENDOR.md, patches/0002-align-cupti-epoch-to-clock-monotonic.patch
+// and patches/0005-bound-the-cupti-teardown-in-stop.patch.
 #ifndef CUPROF_CONFIG_H
 #define CUPROF_CONFIG_H
 
@@ -12,6 +13,10 @@ namespace cuprof {
 struct Config {
     std::string output;
     unsigned duration_sec;
+    // Upper bound (ms) on the CUPTI teardown in CuptiSink::Stop(). Defaults to
+    // 30s whatever the window length; CUPROF_TEARDOWN_TIMEOUT_MS overrides it.
+    // See LoadConfig() and docs/embedding.md.
+    unsigned teardown_timeout_ms;
     bool verbose;
     // Optional unix socket to notify about lifecycle transitions. Empty
     // disables notification. See docs/embedding.md.

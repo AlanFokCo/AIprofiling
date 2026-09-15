@@ -240,7 +240,16 @@ impl CollectorManager {
         })
     }
 
-    fn init_event_thread(&mut self, pid: i32) {
+    /// Start this pid's lifecycle-event listener.
+    ///
+    /// `socket_root` is the host-visible root the socket lives under: production
+    /// passes [`UnixSocketHandler::proc_root`], the tests pass a temp dir.
+    ///
+    /// A bind failure comes back as an `Err` for the caller to decide about, and
+    /// is deliberately not turned into a scheduler event: a terminal event
+    /// enqueued here would race `scheduler::init`, which enqueues `StartCollector`
+    /// only after this returns.
+    async fn init_event_thread(&mut self, pid: i32, socket_root: &str) -> Result<()> {
         // Create or get the broadcast channel sender
         let shutdown_sender = match &self.shutdown_sender {
             Some(sender) => sender.clone(),
@@ -252,9 +261,14 @@ impl CollectorManager {
             }
         };
 
+        // bind_listener_at's error already names the path, the pid and the
+        // cause, so it is passed up unchanged and logged once, by the caller.
+        let listener = UnixSocketHandler::bind_listener_at(socket_root, pid).await?;
+
         let handle: tokio::task::JoinHandle<()> =
-            UnixSocketHandler::start_listen(pid, shutdown_sender);
+            UnixSocketHandler::serve(listener, pid, shutdown_sender);
         self.unixsock_map.insert(pid, Some(handle));
+        Ok(())
     }
 
     // Helper: write collector state into meta
@@ -274,9 +288,25 @@ impl CollectorManager {
     pub async fn init_collectors(&mut self, params: &ProfileArgs, _config: &Config, writer: &mut Writer) -> Result<()> {
         let pids: Vec<_> = self.pid_map.keys().cloned().collect();
 
-        // Initialize event handling threads
+        // Initialize event handling threads. A pid whose socket path is served by
+        // somebody else can neither be driven nor stopped, so it is recorded as
+        // having no listener and the run carries on without it. Failing the whole
+        // run here instead would change what a multi-pid pyki collection does
+        // when one target's socket is taken, or when its /proc entry is simply
+        // unreadable, and pyki's run-level semantics are not this change's to
+        // redefine. What must not happen is the old behaviour: unlinking the
+        // socket whoever owned it, then saying nothing about it.
         for pid in &pids {
-            self.init_event_thread(*pid);
+            if let Err(e) = self
+                .init_event_thread(*pid, &UnixSocketHandler::proc_root(*pid))
+                .await
+            {
+                self.unixsock_map.insert(*pid, None);
+                error!(
+                    "pid {} will be collected without lifecycle events, so its window ends                      in the idle watchdog rather than on WriterOver: {}",
+                    pid, e
+                );
+            }
         }
 
         // Track per-PID collector init status
@@ -650,5 +680,189 @@ impl CollectorManager {
             }
         }
         log::info!("CollectorManager dropping, cleaning up unix socket handlers done.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Used only as a socket-path suffix: every test below points
+    /// `init_event_thread` at a temp dir, so no such process need exist and no
+    /// real agent can be holding the path.
+    const PID: i32 = 4242;
+
+    /// Enough `CollectorManager` to drive `init_event_thread`, built by hand
+    /// instead of through `unsafe new`: that path detects GPUs and instantiates
+    /// collector plugins, none of which a socket test needs. `collectors` stays
+    /// empty on purpose - reaching a wrapper would panic, which is exactly what
+    /// these tests must not do.
+    fn manager() -> CollectorManager {
+        let mut pid_map = HashMap::new();
+        pid_map.insert(PID, Vec::new());
+        let mut meta = HashMap::new();
+        meta.insert(PID, Meta::new());
+        CollectorManager {
+            collectors: HashMap::new(),
+            pid_map,
+            unixsock_map: HashMap::new(),
+            shutdown_sender: None,
+            meta,
+        }
+    }
+
+    /// Stand-in for `/proc/<pid>/root`. `CF_UNIXSOCK` is absolute under `/tmp`,
+    /// which a container root always has but a bare temp dir does not. Driving
+    /// the tests from here keeps them off the test process's own real
+    /// `/proc/<pid>/root/tmp` path, which a parallel runner or a live agent on
+    /// the same host would be free to occupy.
+    fn fake_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::create_dir(root.path().join("tmp")).expect("create <root>/tmp");
+        root
+    }
+
+    fn root_str(root: &tempfile::TempDir) -> &str {
+        root.path().to_str().expect("utf-8 temp path")
+    }
+
+    fn socket_path(root: &tempfile::TempDir) -> String {
+        UnixSocketHandler::socket_path_under(root_str(root), PID)
+    }
+
+    /// The accept loop recorded for `PID`, if `init_event_thread` started one.
+    fn recorded_handle(manager: &mut CollectorManager) -> Option<tokio::task::JoinHandle<()>> {
+        manager.unixsock_map.get_mut(&PID).and_then(|h| h.take())
+    }
+
+    #[tokio::test]
+    async fn a_taken_socket_path_fails_init_event_thread() {
+        // The redesign in one assertion: the failure leaves as an `Err` for
+        // `init_collectors` to propagate, instead of being swallowed here or
+        // enqueued as an event that would race `StartCollector`.
+        let root = fake_root();
+        let foreign = UnixSocketHandler::bind_listener_at(root_str(&root), PID)
+            .await
+            .expect("a fresh temp path binds");
+        let mut manager = manager();
+
+        let err = manager
+            .init_event_thread(PID, root_str(&root))
+            .await
+            .expect_err("a socket path somebody else serves must fail the run");
+
+        let msg = err.to_string();
+        let path = socket_path(&root);
+        let pid_label = format!("pid {}", PID);
+        assert!(
+            msg.contains(path.as_str()) && msg.contains(pid_label.as_str()),
+            "the error must name the path and the pid, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("second aiprof-client"),
+            "the error must hint at a second aiprof-client, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("left behind by an earlier run"),
+            "the error must hint at a leftover socket file, got: {}",
+            msg
+        );
+        assert!(
+            recorded_handle(&mut manager).is_none(),
+            "no accept loop may be recorded for a pid we could not bind"
+        );
+        drop(foreign);
+    }
+
+    #[tokio::test]
+    async fn a_live_foreign_socket_is_not_unlinked() {
+        // The defect this branch exists for: a second aiprof-client profiling
+        // the same pid must keep its event stream.
+        let root = fake_root();
+        let path = socket_path(&root);
+        let foreign = UnixSocketHandler::bind_listener_at(root_str(&root), PID)
+            .await
+            .expect("first bind");
+        let mut manager = manager();
+
+        let bound = manager.init_event_thread(PID, root_str(&root)).await;
+        assert!(
+            bound.is_err(),
+            "a socket path somebody else serves must fail the run, not be swallowed"
+        );
+
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "the failed bind must not unlink a socket it does not own"
+        );
+        std::os::unix::net::UnixStream::connect(&path).expect("foreign socket still connectable");
+        foreign
+            .accept()
+            .await
+            .expect("foreign listener still accepting");
+        assert!(recorded_handle(&mut manager).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_is_reclaimed() {
+        // The other half: a crash residue must not wedge every later run on that
+        // host, so a socket with no listener behind it is taken over.
+        let root = fake_root();
+        let path = socket_path(&root);
+        let stale = UnixSocketHandler::bind_listener_at(root_str(&root), PID)
+            .await
+            .expect("first bind");
+        drop(stale);
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "dropping a listener does not unlink it: that is the residue"
+        );
+
+        let mut manager = manager();
+        manager
+            .init_event_thread(PID, root_str(&root))
+            .await
+            .expect("a stale socket is reclaimed, not fatal");
+
+        let handle = recorded_handle(&mut manager).expect("an accept loop is running");
+        assert!(!handle.is_finished(), "the accept loop must still be alive");
+        std::os::unix::net::UnixStream::connect(&path).expect("reclaimed path is live");
+        manager.drop().await;
+    }
+
+    #[tokio::test]
+    async fn the_accept_loop_stops_on_the_shutdown_broadcast() {
+        // `init_event_thread` now binds and serves in two steps, so pin the
+        // wiring: the recorded handle is the accept loop, and the broadcast the
+        // manager owns is what stops it.
+        let root = fake_root();
+        let mut manager = manager();
+        manager
+            .init_event_thread(PID, root_str(&root))
+            .await
+            .expect("a fresh temp path binds");
+
+        let handle = recorded_handle(&mut manager).expect("an accept loop is recorded");
+        let sender = manager
+            .shutdown_sender
+            .clone()
+            .expect("init_event_thread created the shutdown sender");
+        // The accept loop subscribes only once the spawned task is first polled,
+        // and a broadcast `send` with no receiver is an error rather than a
+        // no-op, so wait for that receiver instead of racing it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sender.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the accept loop must subscribe to the shutdown broadcast");
+        sender.send(()).expect("a live receiver");
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the accept loop must stop on shutdown, not hang")
+            .expect("the accept loop must not panic");
     }
 }
